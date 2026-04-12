@@ -1146,14 +1146,19 @@ class App(tk.Tk):
         dk = tk.Canvas(tab_draw, bg=C["panel"], highlightthickness=0)
         dk.pack(fill="both", expand=True, padx=8, pady=8)
 
+        # Draw canvas layout margins (mirrors oscilloscope style)
+        lpad_d, bpad_d, tpad_d = 28, 14, 6
+
         # Draw state
         draw_state = {"last_x": None, "last_y": None}
 
         def canvas_to_sample(cx, cy, cw, ch):
-            """Convert canvas pixel to (sample_index, value)."""
-            idx = int(cx / max(cw, 1) * cs)
+            """Convert canvas pixel to (sample_index, value) using draw margins."""
+            draw_w = cw - lpad_d
+            draw_h = ch - tpad_d - bpad_d
+            idx = int((cx - lpad_d) / max(draw_w, 1) * cs)
             idx = max(0, min(cs - 1, idx))
-            val = 1.0 - 2.0 * cy / max(ch, 1)
+            val = 1.0 - 2.0 * (cy - tpad_d) / max(draw_h, 1)
             val = max(-1.0, min(1.0, val))
             return idx, val
 
@@ -1161,21 +1166,30 @@ class App(tk.Tk):
             dk.delete("all")
             dw, dh = dk.winfo_width(), dk.winfo_height()
             if dw < 10: return
-            dk.create_line(0, dh//2, dw, dh//2,
-                          fill=C["muted"], dash=(3, 3))
-            for yf, lbl in [(0.25, "+0.5"), (0.75, "-0.5")]:
-                y = int(dh * yf)
-                dk.create_line(0, y, dw, y, fill=C["grid"], dash=(2, 4))
-                dk.create_text(4, y, text=lbl, font=("Consolas", 7),
-                               fill=C["muted"], anchor="w")
-            data = buf[0]
-            n    = len(data)
-            pts  = []
+            # Grid lines
+            for yf, lbl in [(0.0, "+1"), (0.25, "+0.5"), (0.5, "0"),
+                            (0.75, "-0.5"), (1.0, "-1")]:
+                y = int(tpad_d + yf * (dh - tpad_d - bpad_d))
+                dk.create_line(lpad_d, y, dw, y,
+                               fill=C["grid"] if yf != 0.5 else C["muted"],
+                               dash=(3, 3) if yf != 0.5 else ())
+                dk.create_text(lpad_d - 3, y, text=lbl,
+                               font=("Consolas", 7), fill=C["muted"], anchor="e")
+            # Waveform as polygon fill (area between waveform and zero line)
+            data   = buf[0]
+            n      = len(data)
+            zero_y = tpad_d + 0.5 * (dh - tpad_d - bpad_d)
+            pts_top = []
             for i, v in enumerate(data):
-                pts.extend([i / max(n-1,1) * dw,
-                            dh//2 - v * (dh//2 - 4)])
-            if len(pts) >= 4:
-                dk.create_line(*pts, fill=C["wave"], width=1.5)
+                x = lpad_d + (i / max(n-1, 1)) * (dw - lpad_d)
+                y = tpad_d + (0.5 - v * 0.5) * (dh - tpad_d - bpad_d)
+                pts_top.extend([x, y])
+            # Polygon: waveform top + reverse along zero line
+            if len(pts_top) >= 4:
+                poly_pts = pts_top + [dw, zero_y, lpad_d, zero_y]
+                dk.create_polygon(*poly_pts,
+                                  fill="#1a3a5c", outline="")  # subtle fill
+                dk.create_line(*pts_top, fill=C["wave"], width=1.5)
 
         def on_draw_press(event):
             draw_state["last_x"] = event.x
@@ -1302,8 +1316,13 @@ class App(tk.Tk):
                 result = mix * wave_gen + (1.0 - mix) * existing
             elif op == "add":
                 result = existing + wave_gen * mix
+            elif op == "subtract":
+                result = existing - wave_gen * mix
             elif op == "multiply":
                 result = existing * (1.0 - mix + mix * wave_gen)
+            elif op == "divide":
+                denom = 1.0 - mix + mix * (np.abs(wave_gen) + 1e-6)
+                result = existing / denom
             elif op == "min":
                 result = np.minimum(existing, wave_gen * mix + existing * (1-mix))
             elif op == "max":
@@ -1334,7 +1353,8 @@ class App(tk.Tk):
                  bg=C["bg"], fg=C["text"]).grid(row=1, column=0,
                  sticky="w", padx=12, pady=(4, 4))
         for col, (name, val) in enumerate([("Blend","blend"),("Add","add"),
-                                            ("Multiply","multiply"),
+                                            ("Sub","subtract"),("Mul","multiply"),
+                                            ("Div","divide"),
                                             ("Min","min"),("Max","max")]):
             tk.Radiobutton(tab_gen, text=name, variable=gen_op, value=val,
                            bg=C["bg"], fg=C["text"],
@@ -1364,7 +1384,7 @@ class App(tk.Tk):
                   font=("Consolas", 9),
                   bg=C["hot"], fg="#fff",
                   relief="flat", bd=0, padx=10, pady=4).grid(
-                      row=5, column=0, columnspan=6, pady=12)
+                      row=5, column=0, columnspan=8, pady=12)
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 3 — Harmonics
@@ -1546,7 +1566,7 @@ class App(tk.Tk):
             disc      = boundary_discontinuity(cyc)
             # Border: active=hot, phase-warning=amber, phase-bad=red, normal=panel
             if i == self.cycle_idx:
-                border = C["hot"]
+                border = "#00bcd4"   # cyan — active cycle (distinct from phase warnings)
             elif disc > 0.20:
                 border = "#c0392b"   # red — severe discontinuity
             elif disc > 0.05:
