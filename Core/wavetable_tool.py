@@ -285,6 +285,48 @@ def detect_cycle_size(audio: np.ndarray) -> tuple:
     return max(scores, key=scores.get), scores
 
 
+def boundary_discontinuity(cycle: np.ndarray) -> float:
+    """
+    Measure boundary discontinuity as |first - last| / peak_amplitude.
+    0 = perfectly periodic.  >0.05 = audible click.  >0.20 = severe.
+    """
+    peak = max(float(np.max(np.abs(cycle))), 1e-6)
+    return abs(float(cycle[0]) - float(cycle[-1])) / peak
+
+
+def shift_phase(cycle: np.ndarray, offset_samples: int) -> np.ndarray:
+    """Shift a cycle by offset_samples positions (circular)."""
+    return np.roll(cycle, -int(offset_samples)).astype(np.float32)
+
+
+def apply_snap(cycle: np.ndarray) -> np.ndarray:
+    """
+    Force periodicity by subtracting a linear ramp that bridges the
+    start/end discontinuity. Fast and preserves harmonic content.
+    """
+    result = cycle.copy().astype(np.float32)
+    diff   = float(result[-1]) - float(result[0])
+    result -= np.linspace(0, diff, len(result), dtype=np.float32)
+    return result
+
+
+def apply_crossfade(cycle: np.ndarray, n_samples: int) -> np.ndarray:
+    """
+    Blend the boundaries of the cycle with a crossfade over n_samples.
+    Smooths start/end discontinuities without altering the middle.
+    """
+    result = cycle.copy().astype(np.float32)
+    n    = len(cycle)
+    n_cf = max(2, min(n_samples, n // 4))
+    fade_out = np.linspace(1.0, 0.0, n_cf, dtype=np.float32)
+    fade_in  = np.linspace(0.0, 1.0, n_cf, dtype=np.float32)
+    start_blend = cycle[:n_cf] * fade_in  + cycle[-n_cf:] * fade_out
+    end_blend   = cycle[-n_cf:] * fade_out + cycle[:n_cf] * fade_in
+    result[:n_cf]  = start_blend
+    result[-n_cf:] = end_blend
+    return result
+
+
 def classify_cycle(cycle: np.ndarray) -> tuple:
     """
     Classify via FFT harmonic analysis.
@@ -373,6 +415,7 @@ class App(tk.Tk):
         self.export_clm_var  = tk.BooleanVar(value=True)
         self.export_sr_var   = tk.IntVar(value=44100)
         self.export_depth_var= tk.IntVar(value=16)
+        self.phase_offset_var= tk.IntVar(value=0)
 
         self._build()
 
@@ -619,10 +662,26 @@ class App(tk.Tk):
                                     font=("Consolas", 10, "bold"),
                                     bg=C["bg"], fg=C["hot"], padx=10)
         self.cycle_badge.pack(side="left")
-        # Prev / Next cycle buttons — parented to info_row
+        # Cycle navigation and actions — parented to info_row
         self._sbtn(info_row, "◀", self._prev_cycle).pack(side="left", padx=(12, 2))
         self._sbtn(info_row, "▶", self._next_cycle).pack(side="left")
         self._sbtn(info_row, "▶ Play", self._play_cycle).pack(side="left", padx=(16, 0))
+        self._sbtn(info_row, "Delete", self._delete_cycle).pack(side="left", padx=(8, 0))
+        # Phase offset control
+        phase_row = tk.Frame(self.panel_c, bg=C["bg"])
+        phase_row.pack(fill="x", pady=(2, 0))
+        tk.Label(phase_row, text="Phase offset:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self.phase_offset_var = tk.IntVar(value=0)
+        self._sbtn(phase_row, "−1", lambda: self._shift_cycle(-1)).pack(side="left", padx=(6, 1))
+        self._sbtn(phase_row, "−10", lambda: self._shift_cycle(-10)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "−100", lambda: self._shift_cycle(-100)).pack(side="left", padx=1)
+        tk.Label(phase_row, textvariable=self.phase_offset_var, width=6,
+                 font=("Consolas", 9, "bold"), bg=C["bg"], fg=C["hot"]).pack(side="left", padx=4)
+        self._sbtn(phase_row, "+100", lambda: self._shift_cycle(100)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "+10",  lambda: self._shift_cycle(10)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "+1",   lambda: self._shift_cycle(1)).pack(side="left", padx=1)
+        self._sbtn(phase_row, "Reset", self._reset_phase).pack(side="left", padx=(6, 0))
 
         # ── ALL CYCLES thumbnails ──
         tk.Label(p, text="ALL CYCLES",
@@ -939,6 +998,38 @@ class App(tk.Tk):
         threading.Thread(target=_play, daemon=True).start()
 
 
+    def _delete_cycle(self):
+        """Delete the currently displayed cycle from the active bank."""
+        b = self.bank
+        if not b or len(b.cycles) == 0:
+            return
+        if len(b.cycles) == 1:
+            if not messagebox.askyesno("Delete", "This is the last cycle. Delete it?"):
+                return
+        b.cycles.pop(self.cycle_idx)
+        b.audio = np.concatenate(b.cycles) if b.cycles else np.zeros(b.cycle_size, dtype=np.float32)
+        self.cycle_idx = min(self.cycle_idx, max(0, len(b.cycles) - 1))
+        self._update_panel_b()
+        self._refresh()
+        self.status_var.set(f"Cycle deleted. {len(b.cycles)} cycles remaining.")
+
+    def _shift_cycle(self, delta: int):
+        """Shift the current cycle by delta samples (circular)."""
+        b = self.bank
+        if not b or not b.cycles:
+            return
+        cur = self.phase_offset_var.get() + delta
+        b.cycles[self.cycle_idx] = shift_phase(b.cycles[self.cycle_idx], delta)
+        # Keep offset display clamped to [-cs/2, cs/2] for readability
+        cs = b.cycle_size
+        self.phase_offset_var.set(cur % cs if cur >= 0 else -((-cur) % cs))
+        self._draw_wave()
+        self._draw_fft()
+
+    def _reset_phase(self):
+        """Reset phase offset display (does not undo shifts already applied)."""
+        self.phase_offset_var.set(0)
+
     def _new_cycle(self):
         """Create a new bank with a single empty cycle and open the editor."""
         cs = self.cs_var.get()
@@ -1132,11 +1223,49 @@ class App(tk.Tk):
             buf[0] = [0.0] * cs
             draw_canvas_wave()
             draw_preview()
-        tk.Button(tab_draw, text="Clear to zero", command=clear_draw,
+
+        def do_snap():
+            buf[0] = apply_snap(np.array(buf[0], dtype=np.float32)).tolist()
+            draw_canvas_wave()
+            draw_preview()
+
+        def do_crossfade():
+            n_cf = cf_var.get()
+            buf[0] = apply_crossfade(np.array(buf[0], dtype=np.float32), n_cf).tolist()
+            draw_canvas_wave()
+            draw_preview()
+
+        def do_normalize():
+            arr = np.array(buf[0], dtype=np.float32)
+            mx  = np.max(np.abs(arr))
+            if mx > 1e-6:
+                arr /= mx
+            buf[0] = arr.tolist()
+            draw_canvas_wave()
+            draw_preview()
+
+        # Periodicity tools row
+        period_row = tk.Frame(tab_draw, bg=C["bg"])
+        period_row.pack(anchor="w", padx=8, pady=(2, 2))
+        cf_var = tk.IntVar(value=64)
+        for txt, cmd in [("Clear", clear_draw),
+                         ("Snap ends", do_snap),
+                         ("Normalize", do_normalize)]:
+            tk.Button(period_row, text=txt, command=cmd,
+                      font=("Consolas", 8),
+                      bg=C["accent"], fg=C["text"],
+                      relief="flat", bd=0, padx=8, pady=3).pack(side="left", padx=(0, 4))
+        tk.Button(period_row, text="Crossfade",
+                  command=do_crossfade,
                   font=("Consolas", 8),
                   bg=C["accent"], fg=C["text"],
-                  relief="flat", bd=0, padx=8, pady=3).pack(
-                      anchor="w", padx=8, pady=4)
+                  relief="flat", bd=0, padx=8, pady=3).pack(side="left", padx=(0, 4))
+        tk.Label(period_row, text="N=", font=("Consolas", 8),
+                 bg=C["bg"], fg=C["muted"]).pack(side="left")
+        tk.Spinbox(period_row, textvariable=cf_var, from_=4, to=512, width=5,
+                   font=("Consolas", 8),
+                   bg=C["panel"], fg=C["text"],
+                   relief="flat").pack(side="left")
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 2 — Generate
@@ -1144,7 +1273,8 @@ class App(tk.Tk):
         gen_shape   = tk.StringVar(value="sine")
         gen_amp     = tk.DoubleVar(value=1.0)
         gen_phase   = tk.DoubleVar(value=0.0)
-        gen_mix     = tk.DoubleVar(value=1.0)  # 1=replace, 0=add
+        gen_mix     = tk.DoubleVar(value=1.0)  # 1=new wave, 0=existing
+        gen_op      = tk.StringVar(value="blend")  # blend|add|multiply|min|max
 
         def gen_update(*_):
             t     = np.linspace(0, 2 * np.pi, cs, endpoint=False)
@@ -1162,10 +1292,29 @@ class App(tk.Tk):
                     2 * ((t + ph) % (2 * np.pi)) / (2 * np.pi) - 1) - 1
             else:
                 wave_gen = np.zeros(cs)
-            wave_gen = (wave_gen * amp).tolist()
+            wave_gen = wave_gen * amp
             mix      = gen_mix.get()
-            buf[0]   = [mix * g + (1 - mix) * b
-                        for g, b in zip(wave_gen, buf[0])]
+            # mix=1.0 → replace entirely with wave_gen
+            # mix=0.0 → add wave_gen on top of existing buffer (equal blend)
+            existing = np.array(buf[0], dtype=np.float32)
+            op       = gen_op.get()
+            if op == "blend":
+                result = mix * wave_gen + (1.0 - mix) * existing
+            elif op == "add":
+                result = existing + wave_gen * mix
+            elif op == "multiply":
+                result = existing * (1.0 - mix + mix * wave_gen)
+            elif op == "min":
+                result = np.minimum(existing, wave_gen * mix + existing * (1-mix))
+            elif op == "max":
+                result = np.maximum(existing, wave_gen * mix + existing * (1-mix))
+            else:
+                result = wave_gen
+            # Normalize if clipping
+            mx = float(np.max(np.abs(result)))
+            if mx > 1.0:
+                result = result / mx
+            buf[0] = result.tolist()
             draw_canvas_wave()
             draw_preview()
 
@@ -1181,11 +1330,24 @@ class App(tk.Tk):
                            font=("Consolas", 9)).grid(
                                row=0, column=col+1, padx=6, pady=(12,4))
 
+        tk.Label(tab_gen, text="Operator:", font=("Consolas", 9),
+                 bg=C["bg"], fg=C["text"]).grid(row=1, column=0,
+                 sticky="w", padx=12, pady=(4, 4))
+        for col, (name, val) in enumerate([("Blend","blend"),("Add","add"),
+                                            ("Multiply","multiply"),
+                                            ("Min","min"),("Max","max")]):
+            tk.Radiobutton(tab_gen, text=name, variable=gen_op, value=val,
+                           bg=C["bg"], fg=C["text"],
+                           selectcolor=C["accent"],
+                           activebackground=C["bg"],
+                           font=("Consolas", 8)).grid(
+                               row=1, column=col+1, padx=3, pady=(4,4))
+
         for row_i, (lbl, var, mn, mx, res) in enumerate([
-            ("Amplitude", gen_amp,   0.0, 1.0, 0.01),
-            ("Phase (°)", gen_phase, 0.0, 360.0, 1.0),
-            ("Mix (1=replace, 0=add)", gen_mix, 0.0, 1.0, 0.01),
-        ], start=1):
+            ("Amplitude",  gen_amp,   0.0, 1.0,   0.01),
+            ("Phase (°)",  gen_phase, 0.0, 360.0, 1.0),
+            ("Mix",        gen_mix,   0.0, 1.0,   0.01),
+        ], start=2):
             tk.Label(tab_gen, text=lbl, font=("Consolas", 9),
                      bg=C["bg"], fg=C["text"]).grid(
                          row=row_i, column=0, sticky="w", padx=12, pady=4)
@@ -1202,7 +1364,7 @@ class App(tk.Tk):
                   font=("Consolas", 9),
                   bg=C["hot"], fg="#fff",
                   relief="flat", bd=0, padx=10, pady=4).grid(
-                      row=4, column=0, columnspan=5, pady=12)
+                      row=5, column=0, columnspan=6, pady=12)
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 3 — Harmonics
@@ -1330,6 +1492,19 @@ class App(tk.Tk):
             pts.extend([x, y])
         if len(pts) >= 4:
             cv.create_line(*pts, fill=C["wave"], width=1.5, smooth=False)
+        # Phase continuity indicator: vertical markers at start and end
+        disc = boundary_discontinuity(s)
+        marker_color = "#c0392b" if disc > 0.20 else ("#e67e22" if disc > 0.05 else "#2ecc71")
+        marker_h = min(20, int(dh * 0.25))
+        # Start marker
+        cv.create_line(lpad, tpad, lpad, tpad + dh, fill=marker_color, width=2)
+        # End marker
+        cv.create_line(w - rpad, tpad, w - rpad, tpad + dh, fill=marker_color, width=2)
+        # Disc score label
+        if disc > 0.01:
+            cv.create_text(lpad + 4, tpad + 4,
+                           text=f"disc={disc:.2f}",
+                           font=("Consolas", 7), fill=marker_color, anchor="nw")
 
     def _draw_fft(self):
         cv = self.fft_cv
@@ -1368,7 +1543,16 @@ class App(tk.Tk):
             w.destroy()
         for i, cyc in enumerate(self.cycles):
             label, _ = classify_cycle(cyc)
-            border    = C["hot"] if i == self.cycle_idx else C["panel"]
+            disc      = boundary_discontinuity(cyc)
+            # Border: active=hot, phase-warning=amber, phase-bad=red, normal=panel
+            if i == self.cycle_idx:
+                border = C["hot"]
+            elif disc > 0.20:
+                border = "#c0392b"   # red — severe discontinuity
+            elif disc > 0.05:
+                border = "#e67e22"   # amber — audible click
+            else:
+                border = C["panel"]
             frm = tk.Frame(self.thumb_frame, bg=border, padx=1, pady=1)
             frm.pack(side="left", padx=2)
             th = tk.Canvas(frm, width=48, height=44,
@@ -1383,8 +1567,12 @@ class App(tk.Tk):
                 th.create_line(*pts, fill=color, width=1)
             idx = i
             th.bind("<Button-1>", lambda e, idx=idx: self._goto_cycle(idx))
-            tk.Label(frm, text=label[:4].upper(),
-                     font=("Consolas", 7), bg=border, fg=color).pack()
+            # Show discontinuity score under thumbnail
+            disc_txt = f"{disc:.2f}" if disc > 0.01 else ""
+            disc_col = "#c0392b" if disc > 0.20 else ("#e67e22" if disc > 0.05 else color)
+            lbl_txt  = f"{label[:4].upper()} {disc_txt}".strip()
+            tk.Label(frm, text=lbl_txt,
+                     font=("Consolas", 7), bg=border, fg=disc_col).pack()
 
     # ── Export ───────────────────────────────────────────────────────────────
     def _prep_cycles(self, b: Bank | None = None):
