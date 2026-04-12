@@ -186,12 +186,32 @@ def build_clm_chunk(cycle_size: int) -> bytes:
     return b"clm " + struct.pack("<I", CLM_PAYLOAD_SIZE) + payload
 
 
-def write_wav_with_clm(path: str, audio: np.ndarray, sr: int, cs: int):
-    buf = io.BytesIO()
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+def _encode_pcm(audio: np.ndarray, bit_depth: int) -> bytes:
+    """Encode float32 audio to PCM bytes at the given bit depth (16/24/32)."""
+    clipped = np.clip(audio, -1.0, 1.0)
+    if bit_depth == 16:
+        return (clipped * 32767).astype(np.int16).tobytes()
+    elif bit_depth == 24:
+        vals = (clipped * 8388607).astype(np.int32)
+        buf  = bytearray()
+        for v in vals:
+            buf += struct.pack("<i", v)[:3]
+        return bytes(buf)
+    elif bit_depth == 32:
+        return (clipped * 2147483647).astype(np.int32).tobytes()
+    else:
+        raise ValueError(f"Unsupported export bit depth: {bit_depth}")
+
+
+def write_wav_with_clm(path: str, audio: np.ndarray, sr: int, cs: int,
+                       bit_depth: int = 16):
+    """Write a PCM WAV with an injected 'clm ' wavetable chunk."""
+    buf      = io.BytesIO()
+    sw       = bit_depth // 8
+    pcm_data = _encode_pcm(audio, bit_depth)
     with wave.open(buf, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
-        w.writeframes(pcm.tobytes())
+        w.setnchannels(1); w.setsampwidth(sw); w.setframerate(sr)
+        w.writeframes(pcm_data)
     raw      = buf.getvalue()
     data_off = raw.find(b"data")
     if data_off == -1:
@@ -203,23 +223,46 @@ def write_wav_with_clm(path: str, audio: np.ndarray, sr: int, cs: int):
     with open(path, "wb") as f: f.write(new_raw)
 
 
-def write_wav_plain(path: str, audio: np.ndarray, sr: int):
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+def write_wav_plain(path: str, audio: np.ndarray, sr: int, bit_depth: int = 16):
+    """Write a plain PCM mono WAV without wavetable metadata."""
+    sw       = bit_depth // 8
+    pcm_data = _encode_pcm(audio, bit_depth)
     with wave.open(path, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
-        w.writeframes(pcm.tobytes())
+        w.setnchannels(1); w.setsampwidth(sw); w.setframerate(sr)
+        w.writeframes(pcm_data)
 
 
 # ---------------------------------------------------------------------------
 #  Audio analysis
 # ---------------------------------------------------------------------------
 def resample_cycle(cycle: np.ndarray, target: int) -> np.ndarray:
-    if len(cycle) == target:
+    """
+    Resample a periodic waveform cycle using FFT zero-padding / truncation.
+
+    This is the correct method for wavetable cycles:
+    - Upscaling:   zero-pads the spectrum → no new harmonics, perfect reconstruction
+    - Downscaling: truncates the spectrum → clean brick-wall anti-alias filter
+    - Non-power-of-2 sources (e.g. 600 samples) are handled correctly.
+
+    Falls back to linear interpolation only if the input is too short (<4 samples).
+    """
+    n = len(cycle)
+    if n == target:
         return cycle.copy()
-    return np.interp(
-        np.linspace(0, 1, target,     endpoint=False),
-        np.linspace(0, 1, len(cycle), endpoint=False),
-        cycle)
+    if n < 4:
+        return np.interp(
+            np.linspace(0, 1, target,     endpoint=False),
+            np.linspace(0, 1, n,          endpoint=False),
+            cycle).astype(np.float32)
+    spectrum = np.fft.rfft(cycle)
+    if target > n:
+        new_spec = np.zeros(target // 2 + 1, dtype=complex)
+        new_spec[:len(spectrum)] = spectrum
+    else:
+        new_spec = spectrum[:target // 2 + 1]
+    result = np.fft.irfft(new_spec, n=target)
+    result *= target / n
+    return result.astype(np.float32)
 
 
 def detect_cycle_size(audio: np.ndarray) -> tuple:
@@ -328,6 +371,8 @@ class App(tk.Tk):
         self.export_size_var = tk.IntVar(value=2048)
         self.export_n_var    = tk.IntVar(value=0)
         self.export_clm_var  = tk.BooleanVar(value=True)
+        self.export_sr_var   = tk.IntVar(value=44100)
+        self.export_depth_var= tk.IntVar(value=16)
 
         self._build()
 
@@ -469,6 +514,20 @@ class App(tk.Tk):
                      anchor="w", padx=10)
         ttk.Combobox(p, textvariable=self.export_size_var,
                      values=EXPORT_SIZES, state="readonly", width=9,
+                     font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(2, 6))
+
+        tk.Label(p, text="Sample rate (Hz):",
+                 font=("Consolas", 9), bg=C["panel"], fg=C["text"]).pack(
+                     anchor="w", padx=10)
+        ttk.Combobox(p, textvariable=self.export_sr_var,
+                     values=[44100, 48000, 88200, 96000], state="readonly", width=9,
+                     font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(2, 6))
+
+        tk.Label(p, text="Bit depth:",
+                 font=("Consolas", 9), bg=C["panel"], fg=C["text"]).pack(
+                     anchor="w", padx=10)
+        ttk.Combobox(p, textvariable=self.export_depth_var,
+                     values=[16, 24, 32], state="readonly", width=9,
                      font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(2, 8))
 
         self._sep(p)
@@ -502,6 +561,15 @@ class App(tk.Tk):
         tk.Label(p, text="(0 = all)",
                  font=("Consolas", 8), bg=C["panel"],
                  fg=C["muted"]).pack(anchor="w", padx=10, pady=(0, 6))
+
+        # Edit / create waveform
+        self._sep(p)
+        self._lbl_section(p, "EDIT WAVEFORM")
+        self._btn(p, "Edit current cycle...", self._open_editor).pack(
+            fill="x", padx=10, pady=2)
+        self._btn(p, "New cycle from scratch", self._new_cycle).pack(
+            fill="x", padx=10, pady=2)
+        self._sep(p)
 
         # Export buttons
         for txt, cmd in [("Export current cycle",    self._exp_solo),
@@ -751,9 +819,11 @@ class App(tk.Tk):
         if b is None:
             return
 
-        # Sync cycle-size radio to this bank
+        # Sync cycle-size radio and export params to this bank
         self.cs_var.set(b.cycle_size)
         self.export_n_var.set(0)
+        self.export_sr_var.set(b.sr)
+        self.export_depth_var.set(b.bit_depth if b.bit_depth in (16, 24, 32) else 16)
 
         # Bank navigator visibility
         if self.mode == "banks" and len(self.banks) > 1:
@@ -813,12 +883,14 @@ class App(tk.Tk):
 
         # File info
         cs = b.cycle_size
+        avg_br = b.sr * b.bit_depth // 8  # bytes/sec
         self.info_lbl.config(text=(
             f"Total  : {len(b.audio)} samples\n"
             f"Cycles : {len(b.cycles)}\n"
             f"Cycle  : {cs} samples\n"
             f"SR     : {b.sr} Hz\n"
             f"Depth  : {b.bit_depth}-bit\n"
+            f"Bitrate: {avg_br // 1000} kB/s\n"
             f"Dur.   : {cs / b.sr * 1000:.1f} ms/cycle"
         ))
         self.clm_desc_lbl.config(text=self._clm_text())
@@ -866,6 +938,320 @@ class App(tk.Tk):
                     pass
         threading.Thread(target=_play, daemon=True).start()
 
+
+    def _new_cycle(self):
+        """Create a new bank with a single empty cycle and open the editor."""
+        cs = self.cs_var.get()
+        b  = Bank(path="new_cycle.wav",
+                  audio=np.zeros(cs, dtype=np.float32),
+                  sr=self.export_sr_var.get(),
+                  bit_depth=self.export_depth_var.get(),
+                  chunk_info={})
+        b.slice(cs)
+        self.banks    = [b]
+        self.bank_idx = 0
+        self.cycle_idx = 0
+        self._set_mode("file")
+        self._activate(0)
+        self._open_editor()
+
+    def _open_editor(self):
+        """Open the waveform editor Toplevel window."""
+        b = self.bank
+        cs = self.cs_var.get()
+        # Start from current cycle if available, else flat zero
+        if b and b.cycles:
+            init_data = self.cycles[self.cycle_idx].copy()
+        else:
+            init_data = np.zeros(cs, dtype=np.float32)
+
+        ed = tk.Toplevel(self)
+        ed.title("Waveform Editor")
+        ed.configure(bg=C["bg"])
+        ed.geometry("700x520")
+        ed.resizable(True, True)
+
+        # Working buffer — always cs samples
+        buf = [resample_cycle(init_data, cs).tolist()]
+
+        # ── Notebook tabs ────────────────────────────────────────────────────
+        nb = ttk.Notebook(ed)
+        nb.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+
+        tab_draw = tk.Frame(nb, bg=C["bg"])
+        tab_gen  = tk.Frame(nb, bg=C["bg"])
+        tab_harm = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab_draw, text="  Draw  ")
+        nb.add(tab_gen,  text="  Generate  ")
+        nb.add(tab_harm, text="  Harmonics  ")
+
+        # ── Shared preview canvas ────────────────────────────────────────────
+        preview_frame = tk.Frame(ed, bg=C["panel"])
+        preview_frame.pack(fill="x", padx=10, pady=(4, 0))
+        tk.Label(preview_frame, text="PREVIEW",
+                 font=("Consolas", 8), bg=C["panel"], fg=C["muted"]
+                 ).pack(anchor="w", padx=6, pady=(4, 0))
+        pv = tk.Canvas(preview_frame, bg=C["panel"], height=80, highlightthickness=0)
+        pv.pack(fill="x", padx=4, pady=(0, 4))
+
+        def draw_preview():
+            pv.delete("all")
+            pw, ph = pv.winfo_width(), pv.winfo_height()
+            if pw < 10: return
+            # Zero line
+            pv.create_line(0, ph//2, pw, ph//2, fill=C["muted"], dash=(3,3))
+            data = buf[0]
+            n    = len(data)
+            pts  = []
+            for i, v in enumerate(data):
+                pts.extend([i / max(n-1,1) * pw, ph//2 - v * (ph//2 - 4)])
+            if len(pts) >= 4:
+                pv.create_line(*pts, fill=C["wave"], width=1.5)
+        pv.bind("<Configure>", lambda e: draw_preview())
+
+        # ── Bottom bar: apply / add / close ─────────────────────────────────
+        bot = tk.Frame(ed, bg=C["bg"])
+        bot.pack(fill="x", padx=10, pady=6)
+
+        def apply_to_current():
+            """Overwrite the currently displayed cycle."""
+            if not (self.bank and self.bank.cycles):
+                messagebox.showwarning("Editor", "No bank loaded.", parent=ed)
+                return
+            self.bank.cycles[self.cycle_idx] = np.array(buf[0], dtype=np.float32)
+            self._refresh()
+            ed.destroy()
+
+        def add_as_new():
+            """Append the edited cycle as a new cycle in the bank."""
+            if not self.bank:
+                messagebox.showwarning("Editor", "No bank loaded.", parent=ed)
+                return
+            self.bank.cycles.append(np.array(buf[0], dtype=np.float32))
+            n = len(self.bank.cycles)
+            self.bank.audio = np.concatenate(self.bank.cycles)
+            self.cycle_idx = n - 1
+            self._refresh()
+            ed.destroy()
+
+        for txt, cmd in [("Apply to current cycle", apply_to_current),
+                         ("Add as new cycle",        add_as_new)]:
+            tk.Button(bot, text=txt, command=cmd,
+                      font=("Consolas", 9),
+                      bg=C["accent"], fg=C["text"],
+                      activebackground=C["hot"],
+                      relief="flat", bd=0, padx=10, pady=4,
+                      cursor="hand2").pack(side="left", padx=(0, 6))
+        tk.Button(bot, text="Cancel", command=ed.destroy,
+                  font=("Consolas", 9),
+                  bg=C["grid"], fg=C["muted"],
+                  activebackground=C["accent"],
+                  relief="flat", bd=0, padx=10, pady=4,
+                  cursor="hand2").pack(side="left")
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 1 — Draw
+        # ════════════════════════════════════════════════════════════════════
+        dk = tk.Canvas(tab_draw, bg=C["panel"], highlightthickness=0)
+        dk.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Draw state
+        draw_state = {"last_x": None, "last_y": None}
+
+        def canvas_to_sample(cx, cy, cw, ch):
+            """Convert canvas pixel to (sample_index, value)."""
+            idx = int(cx / max(cw, 1) * cs)
+            idx = max(0, min(cs - 1, idx))
+            val = 1.0 - 2.0 * cy / max(ch, 1)
+            val = max(-1.0, min(1.0, val))
+            return idx, val
+
+        def draw_canvas_wave():
+            dk.delete("all")
+            dw, dh = dk.winfo_width(), dk.winfo_height()
+            if dw < 10: return
+            dk.create_line(0, dh//2, dw, dh//2,
+                          fill=C["muted"], dash=(3, 3))
+            for yf, lbl in [(0.25, "+0.5"), (0.75, "-0.5")]:
+                y = int(dh * yf)
+                dk.create_line(0, y, dw, y, fill=C["grid"], dash=(2, 4))
+                dk.create_text(4, y, text=lbl, font=("Consolas", 7),
+                               fill=C["muted"], anchor="w")
+            data = buf[0]
+            n    = len(data)
+            pts  = []
+            for i, v in enumerate(data):
+                pts.extend([i / max(n-1,1) * dw,
+                            dh//2 - v * (dh//2 - 4)])
+            if len(pts) >= 4:
+                dk.create_line(*pts, fill=C["wave"], width=1.5)
+
+        def on_draw_press(event):
+            draw_state["last_x"] = event.x
+            draw_state["last_y"] = event.y
+            dw, dh = dk.winfo_width(), dk.winfo_height()
+            idx, val = canvas_to_sample(event.x, event.y, dw, dh)
+            buf[0][idx] = val
+            draw_canvas_wave()
+            draw_preview()
+
+        def on_draw_drag(event):
+            dw, dh = dk.winfo_width(), dk.winfo_height()
+            lx, ly = draw_state["last_x"], draw_state["last_y"]
+            if lx is None: return
+            # Interpolate between last and current position
+            x0, y0 = lx, ly
+            x1, y1 = event.x, event.y
+            steps = max(abs(x1 - x0), 1)
+            for s in range(steps + 1):
+                t   = s / steps
+                cx  = x0 + t * (x1 - x0)
+                cy  = y0 + t * (y1 - y0)
+                idx, val = canvas_to_sample(cx, cy, dw, dh)
+                buf[0][idx] = val
+            draw_state["last_x"] = event.x
+            draw_state["last_y"] = event.y
+            draw_canvas_wave()
+            draw_preview()
+
+        def on_draw_release(event):
+            draw_state["last_x"] = None
+            draw_state["last_y"] = None
+
+        tk.Label(tab_draw, text="Click and drag to draw the waveform",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]
+                 ).pack(anchor="w", padx=8, pady=(4, 0))
+
+        dk.bind("<ButtonPress-1>",   on_draw_press)
+        dk.bind("<B1-Motion>",       on_draw_drag)
+        dk.bind("<ButtonRelease-1>", on_draw_release)
+        dk.bind("<Configure>",       lambda e: draw_canvas_wave())
+
+        # Clear button
+        def clear_draw():
+            buf[0] = [0.0] * cs
+            draw_canvas_wave()
+            draw_preview()
+        tk.Button(tab_draw, text="Clear to zero", command=clear_draw,
+                  font=("Consolas", 8),
+                  bg=C["accent"], fg=C["text"],
+                  relief="flat", bd=0, padx=8, pady=3).pack(
+                      anchor="w", padx=8, pady=4)
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 2 — Generate
+        # ════════════════════════════════════════════════════════════════════
+        gen_shape   = tk.StringVar(value="sine")
+        gen_amp     = tk.DoubleVar(value=1.0)
+        gen_phase   = tk.DoubleVar(value=0.0)
+        gen_mix     = tk.DoubleVar(value=1.0)  # 1=replace, 0=add
+
+        def gen_update(*_):
+            t     = np.linspace(0, 2 * np.pi, cs, endpoint=False)
+            ph    = gen_phase.get() * np.pi / 180.0
+            amp   = gen_amp.get()
+            shape = gen_shape.get()
+            if shape == "sine":
+                wave_gen = np.sin(t + ph)
+            elif shape == "square":
+                wave_gen = np.sign(np.sin(t + ph))
+            elif shape == "saw":
+                wave_gen = 2 * ((t + ph) % (2 * np.pi)) / (2 * np.pi) - 1
+            elif shape == "triangle":
+                wave_gen = 2 * np.abs(
+                    2 * ((t + ph) % (2 * np.pi)) / (2 * np.pi) - 1) - 1
+            else:
+                wave_gen = np.zeros(cs)
+            wave_gen = (wave_gen * amp).tolist()
+            mix      = gen_mix.get()
+            buf[0]   = [mix * g + (1 - mix) * b
+                        for g, b in zip(wave_gen, buf[0])]
+            draw_canvas_wave()
+            draw_preview()
+
+        tk.Label(tab_gen, text="Shape:", font=("Consolas", 9),
+                 bg=C["bg"], fg=C["text"]).grid(row=0, column=0,
+                 sticky="w", padx=12, pady=(12, 4))
+        for col, (name, val) in enumerate([("Sine","sine"),("Square","square"),
+                                            ("Saw","saw"),("Triangle","triangle")]):
+            tk.Radiobutton(tab_gen, text=name, variable=gen_shape, value=val,
+                           bg=C["bg"], fg=C["text"],
+                           selectcolor=C["accent"],
+                           activebackground=C["bg"],
+                           font=("Consolas", 9)).grid(
+                               row=0, column=col+1, padx=6, pady=(12,4))
+
+        for row_i, (lbl, var, mn, mx, res) in enumerate([
+            ("Amplitude", gen_amp,   0.0, 1.0, 0.01),
+            ("Phase (°)", gen_phase, 0.0, 360.0, 1.0),
+            ("Mix (1=replace, 0=add)", gen_mix, 0.0, 1.0, 0.01),
+        ], start=1):
+            tk.Label(tab_gen, text=lbl, font=("Consolas", 9),
+                     bg=C["bg"], fg=C["text"]).grid(
+                         row=row_i, column=0, sticky="w", padx=12, pady=4)
+            sl = tk.Scale(tab_gen, variable=var, from_=mn, to=mx,
+                          resolution=res, orient="horizontal",
+                          bg=C["bg"], fg=C["text"],
+                          troughcolor=C["accent"],
+                          highlightthickness=0, length=280,
+                          command=lambda v: None)
+            sl.grid(row=row_i, column=1, columnspan=4, padx=8, pady=4, sticky="w")
+
+        tk.Button(tab_gen, text="Apply shape",
+                  command=gen_update,
+                  font=("Consolas", 9),
+                  bg=C["hot"], fg="#fff",
+                  relief="flat", bd=0, padx=10, pady=4).grid(
+                      row=4, column=0, columnspan=5, pady=12)
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 3 — Harmonics
+        # ════════════════════════════════════════════════════════════════════
+        harm_vars = [tk.DoubleVar(value=(1.0 if i == 0 else 0.0))
+                     for i in range(8)]
+
+        def harm_update(*_):
+            t    = np.linspace(0, 2 * np.pi, cs, endpoint=False)
+            wave_h = np.zeros(cs)
+            for i, v in enumerate(harm_vars):
+                amp = v.get()
+                if abs(amp) > 1e-6:
+                    wave_h += amp * np.sin((i + 1) * t)
+            mx = np.max(np.abs(wave_h))
+            if mx > 0:
+                wave_h /= mx
+            buf[0] = wave_h.tolist()
+            draw_canvas_wave()
+            draw_preview()
+
+        tk.Label(tab_harm, text="Harmonic amplitudes (H1=fundamental)",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]
+                 ).grid(row=0, column=0, columnspan=2,
+                        sticky="w", padx=12, pady=(10, 4))
+        for i, hv in enumerate(harm_vars):
+            lbl = f"H{i+1} {'(fund)' if i==0 else '       '}"
+            tk.Label(tab_harm, text=lbl, font=("Consolas", 9),
+                     bg=C["bg"], fg=C["text"]).grid(
+                         row=i+1, column=0, sticky="w", padx=12, pady=3)
+            sl = tk.Scale(tab_harm, variable=hv,
+                          from_=0.0, to=1.0, resolution=0.01,
+                          orient="horizontal", bg=C["bg"], fg=C["text"],
+                          troughcolor=C["accent"],
+                          highlightthickness=0, length=280,
+                          command=lambda v: harm_update())
+            sl.grid(row=i+1, column=1, padx=8, pady=3, sticky="w")
+
+        tk.Button(tab_harm, text="Apply harmonics",
+                  command=harm_update,
+                  font=("Consolas", 9),
+                  bg=C["hot"], fg="#fff",
+                  relief="flat", bd=0, padx=10, pady=4).grid(
+                      row=9, column=0, columnspan=2, pady=12)
+
+        # Initial draw
+        draw_canvas_wave()
+        draw_preview()
+
     def _prev_bank(self):
         if self.banks:
             self._activate((self.bank_idx - 1) % len(self.banks))
@@ -911,17 +1297,39 @@ class App(tk.Tk):
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 10 or h < 10:
             return
-        for yf in [0.25, 0.5, 0.75]:
-            cv.create_line(0, int(h * yf), w, int(h * yf), fill=C["grid"])
-        cv.create_line(0, h // 2, w, h // 2, fill=C["muted"], dash=(4, 4))
-        s = self.cycles[self.cycle_idx]
-        pad = 10
+        # Layout margins for axes labels
+        lpad, rpad, tpad, bpad = 32, 8, 6, 18
+        dw = w - lpad - rpad   # drawable width
+        dh = h - tpad - bpad   # drawable height
+        # Grid + Y axis labels (-1, -0.5, 0, +0.5, +1)
+        for val, label in [(-1.0, "-1"), (-0.5, "-.5"), (0.0, "0"),
+                           (0.5, "+.5"), (1.0, "+1")]:
+            y = tpad + (1.0 - (val + 1) / 2) * dh
+            cv.create_line(lpad, y, w - rpad, y,
+                           fill=C["grid"] if val != 0 else C["muted"],
+                           dash=(4, 4) if val != 0 else ())
+            cv.create_text(lpad - 3, y, text=label,
+                           font=("Consolas", 7), fill=C["muted"], anchor="e")
+        # X axis — sample ticks
+        s      = self.cycles[self.cycle_idx]
+        n_samp = len(s)
+        n_ticks = min(8, n_samp)
+        step    = n_samp // n_ticks
+        for i in range(0, n_samp + 1, step):
+            if i > n_samp:
+                break
+            x = lpad + (i / max(n_samp - 1, 1)) * dw
+            cv.create_line(x, h - bpad, x, h - bpad + 3, fill=C["muted"])
+            cv.create_text(x, h - 2, text=str(i),
+                           font=("Consolas", 7), fill=C["muted"], anchor="s")
+        # Waveform
         pts = []
         for i, v in enumerate(s):
-            pts.extend([pad + i / max(len(s) - 1, 1) * (w - 2 * pad),
-                        h // 2 - float(v) * (h // 2 - pad)])
+            x = lpad + (i / max(n_samp - 1, 1)) * dw
+            y = tpad + (1.0 - (float(v) + 1) / 2) * dh
+            pts.extend([x, y])
         if len(pts) >= 4:
-            cv.create_line(*pts, fill=C["wave"], width=1.5, smooth=True)
+            cv.create_line(*pts, fill=C["wave"], width=1.5, smooth=False)
 
     def _draw_fft(self):
         cv = self.fft_cv
@@ -933,17 +1341,26 @@ class App(tk.Tk):
             return
         _, fft = classify_cycle(self.cycles[self.cycle_idx])
         n      = min(len(fft), 12)
-        pad    = 10
-        slot   = (w - 2 * pad) / max(n, 1)
-        bw     = max(4, int(slot * 0.7))
-        lbls   = ["F","2","3","4","5","6","7","8","9","10","11","12"]
+        # Margins for Y axis
+        lpad, bpad, tpad = 26, 18, 6
+        dh    = h - tpad - bpad
+        slot  = (w - lpad) / max(n, 1)
+        bw    = max(4, int(slot * 0.65))
+        lbls  = ["F","2","3","4","5","6","7","8","9","10","11","12"]
+        # Y axis labels (0, 0.5, 1.0)
+        for val, label in [(0.0, "0"), (0.5, ".5"), (1.0, "1")]:
+            y = tpad + (1.0 - val) * dh
+            cv.create_line(lpad, y, w, y, fill=C["grid"], dash=(3, 3))
+            cv.create_text(lpad - 3, y, text=label,
+                           font=("Consolas", 7), fill=C["muted"], anchor="e")
+        # Bars
         for i in range(n):
-            bh = int(float(fft[i]) * (h - 28))
-            x  = int(pad + i * slot + (slot - bw) / 2)
-            cv.create_rectangle(x, h - 18 - bh, x + bw, h - 18,
+            bh = int(float(fft[i]) * dh)
+            x  = int(lpad + i * slot + (slot - bw) / 2)
+            cv.create_rectangle(x, tpad + dh - bh, x + bw, tpad + dh,
                                 fill=C["hot"] if i == 0 else C["fft"],
                                 outline="")
-            cv.create_text(x + bw // 2, h - 6, text=lbls[i],
+            cv.create_text(x + bw // 2, h - 4, text=lbls[i],
                            font=("Consolas", 7), fill=C["muted"])
 
     def _build_thumbs(self):
@@ -981,10 +1398,11 @@ class App(tk.Tk):
         return [resample_cycle(c, target) for c in cycs], src
 
     def _write(self, path: str, audio: np.ndarray, sr: int, cs: int):
+        depth = self.export_depth_var.get()
         if self.export_clm_var.get():
-            write_wav_with_clm(path, audio, sr, cs)
+            write_wav_with_clm(path, audio, sr, cs, depth)
         else:
-            write_wav_plain(path, audio, sr)
+            write_wav_plain(path, audio, sr, depth)
 
     def _exp_solo(self):
         if not self.cycles:
@@ -1001,8 +1419,9 @@ class App(tk.Tk):
             defaultextension=".wav", filetypes=[("WAV files", "*.wav")])
         if not path:
             return
+        out_sr = self.export_sr_var.get()
         self._write(path, resample_cycle(self.cycles[self.cycle_idx], target),
-                    b.sr, target)
+                    out_sr, target)
         self.status_var.set(f"Exported: {os.path.basename(path)}")
 
     def _exp_separate(self):
@@ -1018,7 +1437,8 @@ class App(tk.Tk):
         for i, c in enumerate(cycs):
             label, _ = classify_cycle(b.cycles[i])
             fname = f"{base}_cycle{i + 1:02d}_{label}_{target}{suf}.wav"
-            self._write(os.path.join(folder, fname), c, b.sr, target)
+            out_sr = self.export_sr_var.get()
+            self._write(os.path.join(folder, fname), c, out_sr, target)
         msg = f"{len(cycs)} files → {folder}"
         self.status_var.set(msg)
         messagebox.showinfo("Export complete", msg)
@@ -1035,7 +1455,8 @@ class App(tk.Tk):
             defaultextension=".wav", filetypes=[("WAV files", "*.wav")])
         if not path:
             return
-        self._write(path, np.concatenate(cycs), src.sr, target)
+        out_sr = self.export_sr_var.get()
+        self._write(path, np.concatenate(cycs), out_sr, target)
         msg = f"{os.path.basename(path)}  |  {len(cycs)} × {target} samp"
         self.status_var.set(msg)
         messagebox.showinfo("Export complete", msg)
