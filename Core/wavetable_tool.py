@@ -327,6 +327,32 @@ def apply_crossfade(cycle: np.ndarray, n_samples: int) -> np.ndarray:
     return result
 
 
+def spectral_coherence(cycles: list, n_harmonics: int = 16) -> dict:
+    """
+    Analyze spectral coherence across all cycles.
+    Returns global score [0,1] and per-cycle scores.
+    1.0 = perfectly coherent, <0.85 = problematic.
+    """
+    if not cycles:
+        return {"global": 0.0, "per_cycle": [], "harm_std": np.zeros(n_harmonics),
+                "profiles": np.zeros((0, n_harmonics)), "mean_profile": np.zeros(n_harmonics)}
+    profiles = []
+    for c in cycles:
+        fft  = np.abs(np.fft.rfft(c))
+        amps = np.array([float(fft[i+1]) if i+1 < len(fft) else 0.0
+                         for i in range(n_harmonics)], dtype=np.float32)
+        mx   = float(amps.max())
+        profiles.append(amps/mx if mx > 0 else amps)
+    P    = np.array(profiles)
+    mean = P.mean(axis=0)
+    sims = []
+    for p in P:
+        norm = float(np.linalg.norm(p)) * float(np.linalg.norm(mean))
+        sims.append(float(np.dot(p, mean)/norm) if norm > 0 else 0.0)
+    return {"global": float(np.mean(sims)), "per_cycle": sims,
+            "harm_std": P.std(axis=0), "profiles": P, "mean_profile": mean}
+
+
 def extract_harmonics(cycle: np.ndarray, n: int = 16) -> np.ndarray:
     """Extract n harmonic amplitudes from cycle, normalized to [0,1]. H[0]=fundamental."""
     fft  = np.abs(np.fft.rfft(cycle))
@@ -497,7 +523,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Wavetable Analyzer & Converter  v5")
         self.configure(bg=C["bg"])
-        self.geometry("1100x780")
+        self.geometry("1280x860")
         self.minsize(900, 640)
 
         # State
@@ -514,6 +540,13 @@ class App(tk.Tk):
         self.export_sr_var   = tk.IntVar(value=44100)
         self.export_depth_var= tk.IntVar(value=16)
         self.phase_offset_var= tk.IntVar(value=0)
+        self.morph_var       = None
+        # Zoom state
+        self._zoom_start: int = 0
+        self._zoom_end:   int = -1
+        # Undo stack
+        self._undo_stack: list = []
+        self._max_undo:   int  = 30
 
         self._build()
 
@@ -584,6 +617,14 @@ class App(tk.Tk):
         self.panel_c = tk.Frame(right_col, bg=C["bg"])
         self.panel_c.pack(fill="both", expand=True, padx=10, pady=(8, 4))
         self._build_panel_c()
+
+        # Keyboard shortcuts
+        self.bind("<Control-z>", self._undo)
+        self.bind("<Control-Z>", self._undo)
+
+        # Keyboard shortcuts
+        self.bind('<Control-z>', self._undo)
+        self.bind('<Control-Z>', self._undo)
 
         # Part D — status bar (aligned with Part C, not full-width)
         self.status_var = tk.StringVar(value="Load a WAV file to get started.")
@@ -744,6 +785,9 @@ class App(tk.Tk):
         self.wave_cv = tk.Canvas(wf, bg=C["panel"], highlightthickness=0)
         self.wave_cv.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.wave_cv.bind("<Configure>", lambda e: self._draw_wave())
+        self.wave_cv.bind("<MouseWheel>",   lambda e: self._zoom_scroll(e.delta))
+        self.wave_cv.bind("<Button-4>",     lambda e: self._zoom_scroll(120))
+        self.wave_cv.bind("<Button-5>",     lambda e: self._zoom_scroll(-120))
 
         ff = tk.Frame(vis_row, bg=C["panel"])
         ff.grid(row=0, column=1, sticky="nsew")
@@ -771,6 +815,12 @@ class App(tk.Tk):
         self._sbtn(info_row, "Delete", self._delete_cycle).pack(side="left", padx=(8, 0))
         self._sbtn(info_row, "← Move", self._cycle_move_left).pack(side="left", padx=(8,1))
         self._sbtn(info_row, "→ Move", self._cycle_move_right).pack(side="left", padx=1)
+        # Zoom controls
+        tk.Label(info_row, text="  Zoom:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left", padx=(8,2))
+        self._sbtn(info_row, "+", self._zoom_in).pack(side="left", padx=1)
+        self._sbtn(info_row, "−", self._zoom_out).pack(side="left", padx=1)
+        self._sbtn(info_row, "Fit", self._zoom_reset).pack(side="left", padx=1)
         # Phase offset control
         phase_row = tk.Frame(self.panel_c, bg=C["bg"])
         phase_row.pack(fill="x", pady=(2, 0))
@@ -786,6 +836,35 @@ class App(tk.Tk):
         self._sbtn(phase_row, "+10",  lambda: self._shift_cycle(10)).pack(side="left", padx=1)
         self._sbtn(phase_row, "+1",   lambda: self._shift_cycle(1)).pack(side="left", padx=1)
         self._sbtn(phase_row, "Reset", self._reset_phase).pack(side="left", padx=(6, 0))
+
+        # ── Morph + spectral coherence row ──
+        morph_row = tk.Frame(p, bg=C["bg"])
+        morph_row.pack(fill="x", pady=(4, 0))
+        tk.Label(morph_row, text="Morph:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self.morph_var = tk.DoubleVar(value=0.0)
+        tk.Scale(morph_row, variable=self.morph_var,
+                 from_=0.0, to=1.0, resolution=0.01,
+                 orient="horizontal", length=180,
+                 bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
+                 highlightthickness=0, showvalue=False,
+                 command=self._on_morph).pack(side="left", padx=4)
+        self.morph_lbl = tk.Label(morph_row, text="A←→B",
+                                  font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
+        self.morph_lbl.pack(side="left", padx=4)
+        self.coh_lbl = tk.Label(morph_row, text="",
+                                font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
+        self.coh_lbl.pack(side="right", padx=8)
+        # Spectral coherence strip
+        coh_frame = tk.Frame(p, bg=C["panel"])
+        coh_frame.pack(fill="x", pady=(2, 0))
+        tk.Label(coh_frame, text="SPECTRAL COHERENCE",
+                 font=("Consolas", 7), bg=C["panel"], fg=C["muted"]).pack(
+                     anchor="w", padx=6, pady=(2, 0))
+        self.coh_cv = tk.Canvas(coh_frame, bg=C["panel"], height=36,
+                                highlightthickness=0)
+        self.coh_cv.pack(fill="x", padx=4, pady=(0, 2))
+        self.coh_cv.bind("<Configure>", lambda e: self._draw_coherence())
 
         # ── ALL CYCLES thumbnails ──
         tk.Label(p, text="ALL CYCLES",
@@ -1104,6 +1183,7 @@ class App(tk.Tk):
 
     def _cycle_move_left(self):
         """Move current cycle one position to the left in the bank."""
+        self._push_undo()
         b = self.bank
         if not b or len(b.cycles) < 2 or self.cycle_idx == 0:
             return
@@ -1115,6 +1195,7 @@ class App(tk.Tk):
 
     def _cycle_move_right(self):
         """Move current cycle one position to the right in the bank."""
+        self._push_undo()
         b = self.bank
         if not b or len(b.cycles) < 2 or self.cycle_idx >= len(b.cycles)-1:
             return
@@ -1126,6 +1207,7 @@ class App(tk.Tk):
 
     def _delete_cycle(self):
         """Delete the currently displayed cycle from the active bank."""
+        self._push_undo()
         b = self.bank
         if not b or len(b.cycles) == 0:
             return
@@ -1141,6 +1223,7 @@ class App(tk.Tk):
 
     def _shift_cycle(self, delta: int):
         """Shift the current cycle by delta samples (circular)."""
+        self._push_undo()
         b = self.bank
         if not b or not b.cycles:
             return
@@ -1202,7 +1285,7 @@ class App(tk.Tk):
         ed = tk.Toplevel(self)
         ed.title("Waveform Editor")
         ed.configure(bg=C["bg"])
-        ed.geometry("700x520")
+        ed.geometry("820x640")
         ed.resizable(True, True)
 
         # Working buffer — always cs samples
@@ -1234,15 +1317,28 @@ class App(tk.Tk):
             pv.delete("all")
             pw, ph = pv.winfo_width(), pv.winfo_height()
             if pw < 10: return
-            # Zero line
-            pv.create_line(0, ph//2, pw, ph//2, fill=C["muted"], dash=(3,3))
+            wh = (ph * 2) // 3   # top 2/3 waveform
+            fh = ph - wh - 2     # bottom 1/3 FFT
+            # Waveform
+            pv.create_line(0, wh//2, pw, wh//2, fill=C["muted"], dash=(3,3))
             data = buf[0]
             n    = len(data)
             pts  = []
             for i, v in enumerate(data):
-                pts.extend([i / max(n-1,1) * pw, ph//2 - v * (ph//2 - 4)])
+                pts.extend([i/max(n-1,1)*pw, wh//2 - float(v)*(wh//2-3)])
             if len(pts) >= 4:
                 pv.create_line(*pts, fill=C["wave"], width=1.5)
+            # FFT bars
+            fft_vals = extract_harmonics(np.array(data, dtype=np.float32), 16)
+            slot = pw / 16
+            bw   = max(2, int(slot * 0.7))
+            pv.create_line(0, wh+1, pw, wh+1, fill=C["grid"])
+            for i, amp in enumerate(fft_vals):
+                bh = int(float(amp) * fh)
+                x  = int(i * slot + (slot-bw)/2)
+                pv.create_rectangle(x, ph-bh, x+bw, ph,
+                                    fill=C["hot"] if i==0 else C["fft"],
+                                    outline="")
         pv.bind("<Configure>", lambda e: draw_preview())
 
         # ── Bottom bar: apply / add / close ─────────────────────────────────
@@ -1779,7 +1875,7 @@ class App(tk.Tk):
         sc = tk.Toplevel(self)
         sc.title("Cycle Scanner")
         sc.configure(bg=C["bg"])
-        sc.geometry("820x600")
+        sc.geometry("900x680")
         sc.resizable(True, True)
 
         # State
@@ -2054,6 +2150,100 @@ class App(tk.Tk):
             draw_overview()
             draw_detail()
 
+    def spectral_coherence_bank(self):
+        """Return spectral_coherence result for current bank cycles."""
+        return spectral_coherence(self.cycles) if self.cycles else {}
+
+    def _on_morph(self, val=None):
+        """Interpolate between cycle[idx] and cycle[idx+1] for live preview."""
+        b = self.bank
+        if not b or len(b.cycles) < 2:
+            if self.morph_lbl: self.morph_lbl.config(text="Need ≥2 cycles")
+            return
+        t     = float(self.morph_var.get())
+        idx_a = self.cycle_idx % len(b.cycles)
+        idx_b = (self.cycle_idx + 1) % len(b.cycles)
+        ca, cb = b.cycles[idx_a], b.cycles[idx_b]
+        n = max(len(ca), len(cb))
+        if len(ca) != n: ca = resample_cycle(ca, n)
+        if len(cb) != n: cb = resample_cycle(cb, n)
+        morphed = ((1-t)*ca + t*cb).astype(np.float32)
+        self.morph_lbl.config(text=f"C{idx_a+1}←{t:.2f}→C{idx_b+1}")
+        # Draw morphed waveform (purple)
+        cv = self.wave_cv
+        cv.delete("all")
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        lp,rp,tp,bp = 32,8,6,18; dw=w-lp-rp; dh=h-tp-bp
+        for vv,ll in [(-1.,"-1"),(-.5,"-.5"),(0.,"0"),(.5,"+.5"),(1.,"+1")]:
+            y = tp+(1.-(vv+1)/2)*dh
+            cv.create_line(lp,y,w-rp,y,fill=C["grid"] if vv!=0 else C["muted"],
+                           dash=(4,4) if vv!=0 else ())
+            cv.create_text(lp-3,y,text=ll,font=("Consolas",7),fill=C["muted"],anchor="e")
+        pts=[]
+        for i,v in enumerate(morphed):
+            pts.extend([lp+i/max(len(morphed)-1,1)*dw, tp+(1.-(float(v)+1)/2)*dh])
+        if len(pts)>=4: cv.create_line(*pts, fill="#ce93d8", width=1.5)
+        # Draw morphed FFT
+        _,fft_m = classify_cycle(morphed)
+        fc=self.fft_cv; fc.delete("all")
+        fw,fh=fc.winfo_width(),fc.winfo_height()
+        if fw>10:
+            lp2,bp2,tp2=26,18,6; dh2=fh-tp2-bp2
+            slot=(fw-lp2)/max(len(fft_m),1); bw2=max(4,int(slot*.65))
+            for vv,ll in [(0.,"0"),(.5,".5"),(1.,"1")]:
+                yy=tp2+(1.-vv)*dh2
+                fc.create_line(lp2,yy,fw,yy,fill=C["grid"],dash=(3,3))
+                fc.create_text(lp2-3,yy,text=ll,font=("Consolas",7),fill=C["muted"],anchor="e")
+            lbls=["F","2","3","4","5","6","7","8","9","10","11","12"]
+            for ii in range(min(len(fft_m),12)):
+                bh2=int(float(fft_m[ii])*dh2); xx=int(lp2+ii*slot+(slot-bw2)/2)
+                fc.create_rectangle(xx,tp2+dh2-bh2,xx+bw2,tp2+dh2,
+                                    fill="#ce93d8" if ii==0 else C["fft"],outline="")
+                fc.create_text(xx+bw2//2,fh-4,text=lbls[ii],font=("Consolas",7),fill=C["muted"])
+
+    def _draw_coherence(self):
+        """Draw per-cycle spectral coherence as a colored bar strip."""
+        cv = self.coh_cv
+        cv.delete("all")
+        if not self.cycles or len(self.cycles) < 2: return
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        result = spectral_coherence(self.cycles)
+        scores = result["per_cycle"]
+        glob   = result["global"]
+        n      = len(scores)
+        for i, score in enumerate(scores):
+            x  = int(i*w/n); bw = max(2, int(w/n)-2)
+            bh = int(score*(h-12))
+            col = "#2ecc71" if score>0.95 else ("#e67e22" if score>0.85 else "#c0392b")
+            cv.create_rectangle(x, h-12-bh, x+bw, h-12, fill=col, outline="")
+        gc = "#2ecc71" if glob>0.95 else ("#e67e22" if glob>0.85 else "#c0392b")
+        cv.create_text(w-4, 2, text=f"global:{glob:.3f}",
+                       font=("Consolas",7), fill=gc, anchor="ne")
+        self.coh_lbl.config(text=f"Coherence:{glob:.3f}", fg=gc)
+
+    def _push_undo(self):
+        b = self.bank
+        if not b: return
+        self._undo_stack.append(
+            (self.bank_idx, self.cycle_idx, [c.copy() for c in b.cycles]))
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+
+    def _undo(self, event=None):
+        if not self._undo_stack:
+            self.status_var.set("Nothing to undo."); return
+        bidx, cidx, snap = self._undo_stack.pop()
+        if 0 <= bidx < len(self.banks):
+            b = self.banks[bidx]
+            b.cycles = snap
+            b.audio  = np.concatenate(snap) if snap else np.zeros(b.cycle_size, dtype=np.float32)
+            self.bank_idx  = bidx
+            self.cycle_idx = min(cidx, max(0, len(snap)-1))
+            self._refresh()
+            self.status_var.set(f"Undo — {len(self._undo_stack)} step(s) left.")
+
     def _zoom_in(self):
         if not self.cycles: return
         n    = len(self.cycles[self.cycle_idx])
@@ -2129,6 +2319,13 @@ class App(tk.Tk):
         self._draw_wave()
         self._draw_fft()
         self._build_thumbs()
+        self._draw_coherence()
+        if self.morph_var is not None:
+            self.morph_var.set(0.0)
+            if len(self.cycles) >= 2:
+                ib = (self.cycle_idx+1)%len(self.cycles)
+                self.morph_lbl.config(
+                    text=f"C{self.cycle_idx+1}←0.00→C{ib+1}")
 
     def _draw_wave(self):
         cv = self.wave_cv
