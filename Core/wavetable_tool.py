@@ -327,6 +327,59 @@ def apply_crossfade(cycle: np.ndarray, n_samples: int) -> np.ndarray:
     return result
 
 
+def build_heatmap(cycles: list, n_harmonics: int = 16) -> 'np.ndarray':
+    """
+    Build a 2D heatmap array [n_cycles × n_harmonics].
+    Each cell = amplitude of harmonic H(j+1) in cycle i.
+    Values normalized per-harmonic across cycles to [0,1].
+    """
+    if not cycles:
+        return np.zeros((0, n_harmonics), dtype=np.float32)
+    data = []
+    for c in cycles:
+        fft  = np.abs(np.fft.rfft(c))
+        amps = np.array([float(fft[i+1]) if i+1 < len(fft) else 0.0
+                         for i in range(n_harmonics)], dtype=np.float32)
+        data.append(amps)
+    arr = np.array(data, dtype=np.float32)
+    for h in range(n_harmonics):
+        col = arr[:, h]
+        mn, mx = float(col.min()), float(col.max())
+        if mx > mn:
+            arr[:, h] = (col - mn) / (mx - mn)
+    return arr
+
+
+def build_morph_coherence_path(cycles: list, n_steps: int = 200) -> 'np.ndarray':
+    """
+    Compute spectral coherence score along the full bank morph path.
+    Returns array of n_steps floats in [0,1].
+    """
+    if len(cycles) < 2:
+        return np.ones(n_steps, dtype=np.float32)
+    mean_fft = np.mean(
+        [np.abs(np.fft.rfft(c))[:17] for c in cycles], axis=0).astype(np.float32)
+    result = []
+    n = len(cycles)
+    for i in range(n_steps):
+        pos   = i / (n_steps - 1) * (n - 1)
+        idx_a = int(pos)
+        idx_b = min(idx_a + 1, n - 1)
+        t_m   = pos - idx_a
+        ca, cb = cycles[idx_a], cycles[idx_b]
+        sz = max(len(ca), len(cb))
+        if len(ca) != sz:
+            ca = np.interp(np.linspace(0,1,sz,endpoint=False),
+                           np.linspace(0,1,len(ca),endpoint=False), ca)
+        if len(cb) != sz:
+            cb = np.interp(np.linspace(0,1,sz,endpoint=False),
+                           np.linspace(0,1,len(cb),endpoint=False), cb)
+        m_fft = np.abs(np.fft.rfft(((1-t_m)*ca + t_m*cb).astype(np.float32)))[:17]
+        norm  = float(np.linalg.norm(m_fft)) * float(np.linalg.norm(mean_fft))
+        result.append(float(np.dot(m_fft, mean_fft) / norm) if norm > 0 else 0.0)
+    return np.array(result, dtype=np.float32)
+
+
 def spectral_coherence(cycles: list, n_harmonics: int = 16) -> dict:
     """
     Analyze spectral coherence across all cycles.
@@ -547,7 +600,13 @@ class App(tk.Tk):
         # Playback state
         self._loop_running:  bool = False
         self._loop_thread          = None
-        self._morph_cached         = None  # cached morphed cycle for play
+        self._morph_cached         = None
+        # Multi-cycle selection for overlay (set of indices)
+        self._selected_cycles: set = set()
+        # View mode: "waveform" | "fft" | "heatmap" | "harmonic_lines"
+        self._view_mode:       str = "waveform"
+        # Global morph position (0..n_cycles-1)
+        self._global_morph_pos: float = 0.0
         # Undo stack
         self._undo_stack: list = []
         self._max_undo:   int  = 30
@@ -792,6 +851,8 @@ class App(tk.Tk):
         self.wave_cv.bind("<MouseWheel>",   lambda e: self._zoom_scroll(e.delta))
         self.wave_cv.bind("<Button-4>",     lambda e: self._zoom_scroll(120))
         self.wave_cv.bind("<Button-5>",     lambda e: self._zoom_scroll(-120))
+        self.wave_cv.bind("<B2-Motion>",    self._on_pan_wave)  # middle-click drag
+        self.wave_cv.bind("<B3-Motion>",    self._on_pan_wave)  # right-click drag
 
         ff = tk.Frame(vis_row, bg=C["panel"])
         ff.grid(row=0, column=1, sticky="nsew")
@@ -800,6 +861,58 @@ class App(tk.Tk):
         self.fft_cv = tk.Canvas(ff, bg=C["panel"], highlightthickness=0)
         self.fft_cv.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.fft_cv.bind("<Configure>", lambda e: self._draw_fft())
+
+        # ── View mode tabs ──
+        tab_row = tk.Frame(p, bg=C["bg"])
+        tab_row.pack(fill="x", pady=(2, 0))
+        self._view_btns = {}
+        for lbl, mode in [("Waveform","waveform"),("FFT","fft"),
+                          ("Heatmap","heatmap"),("Lines","harmonic_lines")]:
+            b = tk.Button(tab_row, text=lbl,
+                          font=("Consolas", 8),
+                          bg=C["hot"] if mode=="waveform" else C["accent"],
+                          fg=C["text"],
+                          activebackground=C["hot"],
+                          relief="flat", bd=0, padx=8, pady=3,
+                          cursor="hand2",
+                          command=lambda m=mode: self._set_view_mode(m))
+            b.pack(side="left", padx=2)
+            self._view_btns[mode] = b
+        # View checkboxes
+        self._show_overlay_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(tab_row, text="Overlay",
+                       variable=self._show_overlay_var,
+                       command=self._refresh_view,
+                       bg=C["bg"], fg=C["text"],
+                       selectcolor=C["accent"],
+                       activebackground=C["bg"],
+                       font=("Consolas", 8)).pack(side="left", padx=(8,2))
+        self._show_legend_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(tab_row, text="Legend",
+                       variable=self._show_legend_var,
+                       command=self._refresh_view,
+                       bg=C["bg"], fg=C["text"],
+                       selectcolor=C["accent"],
+                       activebackground=C["bg"],
+                       font=("Consolas", 8)).pack(side="left", padx=2)
+
+        # ── Global morph slider ──
+        gmorph_row = tk.Frame(p, bg=C["bg"])
+        gmorph_row.pack(fill="x", pady=(2, 0))
+        tk.Label(gmorph_row, text="Global morph:",
+                 font=("Consolas", 8), bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self.global_morph_var = tk.DoubleVar(value=0.0)
+        self.global_morph_scale = tk.Scale(
+            gmorph_row, variable=self.global_morph_var,
+            from_=0.0, to=1.0, resolution=0.001,
+            orient="horizontal", length=220,
+            bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
+            highlightthickness=0, showvalue=False,
+            command=self._on_global_morph)
+        self.global_morph_scale.pack(side="left", padx=4)
+        self.global_morph_lbl = tk.Label(gmorph_row, text="pos: 0.00",
+                                         font=("Consolas", 8), bg=C["bg"], fg=C["muted"])
+        self.global_morph_lbl.pack(side="left", padx=4)
 
         # ── Cycle label + badge ──
         info_row = tk.Frame(p, bg=C["bg"])
@@ -2275,30 +2388,257 @@ class App(tk.Tk):
                     cv.create_text(x+bw//2, row_h-bh-2, text=f"{score:.2f}",
                                    font=("Consolas",6), fill="#00bcd4", anchor="s")
             self.coh_global_lbl.config(text=f"global: {glob:.3f}", fg=gc)
-        # ── Bottom row: morph coherence gradient ─────────────────────────────
-        t = float(self.morph_var.get()) if self.morph_var else 0.0
-        if t > 0 and len(self.cycles) >= 2 and morph_score is not None:
-            # Draw gradient bar: green at left → morph_col at morph position
-            steps = max(1, w)
-            morph_col = ("#2ecc71" if morph_score>0.95 else
-                         "#e67e22" if morph_score>0.85 else "#c0392b")
-            # Simplified: draw two rects
-            xm = int(t * w)
-            cv.create_rectangle(0, row_h+1, xm, h,
-                                 fill=morph_col, outline="")
-            cv.create_rectangle(xm, row_h+1, w, h,
-                                 fill=C["grid"], outline="")
-            cv.create_line(xm, row_h+1, xm, h, fill="#ffffff", width=1)
-            cv.create_text(min(xm+4, w-4), row_h+4,
-                           text=f"morph:{morph_score:.3f}",
-                           font=("Consolas",6), fill="#ffffff", anchor="nw")
-            self.morph_coh_lbl.config(
-                text=f"Morph coherence: {morph_score:.3f}", fg=morph_col)
+             # ── Bottom row: full-bank morph coherence gradient ────────────────────────
+        if len(self.cycles) >= 2:
+            path = build_morph_coherence_path(self.cycles, n_steps=max(w,2))
+            fh2  = h - row_h - 1
+            for x_px in range(w):
+                score_px = float(path[min(x_px, len(path)-1)])
+                r   = int(min(255, max(0, int((1-score_px)*2*255))))
+                g   = int(min(255, max(0, int(score_px*2*255))))
+                col = f"#{r:02x}{g:02x}40"
+                bh2 = max(1, int(score_px * fh2))
+                cv.create_line(x_px, h-bh2, x_px, h, fill=col)
+            # White cursor = global morph position
+            gpos = float(self.global_morph_var.get()) if hasattr(self,'global_morph_var') else 0.0
+            xm   = int(gpos * (w-1))
+            cv.create_line(xm, row_h+1, xm, h, fill="#ffffff", width=2)
+            # Purple cursor = local morph (between current cycle pair)
+            t_loc = float(self.morph_var.get()) if self.morph_var else 0.0
+            n_c   = len(self.cycles)
+            x_loc = int((self.cycle_idx + t_loc) / max(n_c-1,1) * (w-1))
+            cv.create_line(x_loc, row_h+1, x_loc, h, fill="#ce93d8", width=1)
+            if morph_score is not None:
+                mc = "#2ecc71" if morph_score>0.95 else ("#e67e22" if morph_score>0.85 else "#c0392b")
+                self.morph_coh_lbl.config(text=f"Morph:{morph_score:.3f}", fg=mc)
         else:
-            # No morph active — show help text
-            cv.create_text(4, row_h+2, text="← morph gradient (drag slider)",
+            cv.create_text(4, row_h+2, text="← load ≥2 cycles for morph path",
                            font=("Consolas",6), fill=C["muted"], anchor="nw")
             self.morph_coh_lbl.config(text="", fg=C["muted"])
+    def _set_view_mode(self, mode: str):
+        """Switch the main view mode and update tab button highlights."""
+        self._view_mode = mode
+        for m, btn in self._view_btns.items():
+            btn.config(bg=C["hot"] if m == mode else C["accent"])
+        self._refresh_view()
+
+    def _refresh_view(self):
+        """Redraw canvases according to current view mode."""
+        if self._view_mode == "waveform":
+            self._draw_wave()
+            self._draw_fft()
+        elif self._view_mode == "fft":
+            self.wave_cv.delete("all")
+            self._draw_fft()
+        elif self._view_mode == "heatmap":
+            self._draw_heatmap()
+            self._draw_fft()
+        elif self._view_mode == "harmonic_lines":
+            self._draw_harmonic_lines()
+            self._draw_fft()
+        if self._show_overlay_var.get() and self._selected_cycles:
+            self._draw_overlay()
+
+    def _toggle_cycle_selection(self, idx: int):
+        """Toggle idx in _selected_cycles (Ctrl+click style on thumbnails)."""
+        if idx in self._selected_cycles:
+            self._selected_cycles.discard(idx)
+        else:
+            self._selected_cycles.add(idx)
+        self._build_thumbs()
+        if self._show_overlay_var.get():
+            self._draw_overlay()
+
+    def _draw_overlay(self):
+        """Draw selected cycles as colored overlays on the wave canvas."""
+        if not self._selected_cycles or not self.cycles:
+            return
+        cv = self.wave_cv
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        lpad, rpad, tpad, bpad = 32, 8, 6, 18
+        dw, dh = w-lpad-rpad, h-tpad-bpad
+        # Color palette for overlays
+        palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
+                   "#c77dff","#f4845f","#48cae4","#e9c46a"]
+        legend_y = tpad + 4
+        for i, sel_idx in enumerate(sorted(self._selected_cycles)):
+            if sel_idx >= len(self.cycles): continue
+            cyc   = self.cycles[sel_idx]
+            color = palette[i % len(palette)]
+            # Apply zoom
+            zs = max(0, self._zoom_start)
+            ze = len(cyc) if self._zoom_end < 0 else min(self._zoom_end, len(cyc))
+            view = cyc[zs:ze]
+            pts  = []
+            for j, v in enumerate(view):
+                x = lpad + j/max(len(view)-1,1)*dw
+                y = tpad + (1.-(float(v)+1)/2)*dh
+                pts.extend([x, y])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=color, width=1, dash=(4,2))
+            # Legend
+            if self._show_legend_var.get():
+                label, _ = classify_cycle(cyc)
+                cv.create_rectangle(lpad+4, legend_y, lpad+14, legend_y+8,
+                                    fill=color, outline="")
+                cv.create_text(lpad+18, legend_y+4,
+                               text=f"C{sel_idx+1} {label}",
+                               font=("Consolas",7), fill=color, anchor="w")
+                legend_y += 12
+
+    def _draw_heatmap(self):
+        """Draw spectral heatmap: cycles (Y) × harmonics (X), color = amplitude."""
+        cv = self.wave_cv
+        cv.delete("all")
+        if not self.cycles:
+            return
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        n_harm = 16
+        hm     = build_heatmap(self.cycles, n_harm)
+        n_cyc  = len(hm)
+        if n_cyc == 0: return
+        cell_w = (w - 36) / n_harm
+        cell_h = (h - 16) / n_cyc
+        # Draw cells
+        for ci in range(n_cyc):
+            for hi in range(n_harm):
+                val = float(hm[ci, hi])
+                # Color: black → blue → cyan → green → yellow → red
+                if val < 0.25:
+                    r,g,b = 0, 0, int(val*4*255)
+                elif val < 0.5:
+                    r,g,b = 0, int((val-0.25)*4*255), 255
+                elif val < 0.75:
+                    r,g,b = 0, 255, int((1-(val-0.5)*4)*255)
+                else:
+                    r,g,b = int((val-0.75)*4*255), 255, 0
+                col = f"#{r:02x}{g:02x}{b:02x}"
+                x1 = 36 + hi * cell_w
+                y1 = ci * cell_h
+                cv.create_rectangle(x1, y1, x1+cell_w-1, y1+cell_h-1,
+                                    fill=col, outline="")
+            # Y axis: cycle label
+            y_mid = ci * cell_h + cell_h/2
+            is_cur = (ci == self.cycle_idx)
+            cv.create_text(2, y_mid, text=f"C{ci+1}",
+                           font=("Consolas", 7),
+                           fill="#00bcd4" if is_cur else C["muted"],
+                           anchor="w")
+        # X axis: harmonic labels
+        lbls = ["F","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"]
+        for hi in range(n_harm):
+            x_mid = 36 + hi * cell_w + cell_w/2
+            cv.create_text(x_mid, h-4, text=lbls[hi],
+                           font=("Consolas", 7), fill=C["muted"])
+
+    def _draw_harmonic_lines(self):
+        """Draw harmonic evolution curves: one line per harmonic across cycles."""
+        cv = self.wave_cv
+        cv.delete("all")
+        if not self.cycles or len(self.cycles) < 2:
+            return
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 10: return
+        n_harm = 12
+        lpad, rpad, tpad, bpad = 36, 8, 6, 18
+        dw, dh = w-lpad-rpad, h-tpad-bpad
+        palette = ["#ff6b6b","#ffd93d","#6bcb77","#4d96ff",
+                   "#c77dff","#f4845f","#48cae4","#e9c46a",
+                   "#ff9f1c","#cbf3f0","#ffbfd3","#a8dadc"]
+        # Extract harmonic profiles
+        profiles = []
+        for c in self.cycles:
+            fft  = np.abs(np.fft.rfft(c))
+            amps = [float(fft[i+1]) if i+1 < len(fft) else 0.0
+                    for i in range(n_harm)]
+            profiles.append(amps)
+        profiles = np.array(profiles)
+        # Normalize each harmonic independently
+        for hi in range(n_harm):
+            col = profiles[:,hi]
+            mn, mx = col.min(), col.max()
+            if mx > mn:
+                profiles[:,hi] = (col-mn)/(mx-mn)
+        # Grid
+        for yf in [0.25,0.5,0.75,1.0]:
+            y = tpad + (1-yf)*dh
+            cv.create_line(lpad, y, w-rpad, y, fill=C["grid"], dash=(2,4))
+        # Draw one line per harmonic
+        n_cyc = len(self.cycles)
+        legend_y = tpad + 2
+        lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8",
+                "H9","H10","H11","H12"]
+        for hi in range(n_harm):
+            color = palette[hi % len(palette)]
+            pts   = []
+            for ci in range(n_cyc):
+                x = lpad + ci/max(n_cyc-1,1)*dw
+                y = tpad + (1-profiles[ci,hi])*dh
+                pts.extend([x,y])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill=color, width=1.5, smooth=True)
+            # Legend
+            if self._show_legend_var.get():
+                cv.create_rectangle(lpad+2, legend_y, lpad+10, legend_y+6,
+                                    fill=color, outline="")
+                cv.create_text(lpad+14, legend_y+3,
+                               text=lbls[hi],
+                               font=("Consolas",6), fill=color, anchor="w")
+                legend_y += 9
+        # X axis: cycle numbers
+        for ci in range(n_cyc):
+            x = lpad + ci/max(n_cyc-1,1)*dw
+            cv.create_text(x, h-4, text=str(ci+1),
+                           font=("Consolas",7), fill=C["muted"])
+
+    def _on_global_morph(self, val=None):
+        """Global morph slider — sets position across the full bank."""
+        if not self.cycles or len(self.cycles) < 2:
+            return
+        t     = float(self.global_morph_var.get())
+        n     = len(self.cycles)
+        pos   = t * (n - 1)
+        idx_a = int(pos)
+        idx_b = min(idx_a+1, n-1)
+        t_loc = pos - idx_a
+        ca, cb = self.cycles[idx_a], self.cycles[idx_b]
+        sz = max(len(ca), len(cb))
+        if len(ca) != sz: ca = resample_cycle(ca, sz)
+        if len(cb) != sz: cb = resample_cycle(cb, sz)
+        morphed = ((1-t_loc)*ca + t_loc*cb).astype(np.float32)
+        self._morph_cached = morphed
+        self.global_morph_lbl.config(
+            text=f"pos:{pos:.2f} C{idx_a+1}↔C{idx_b+1}")
+        # Sync local morph slider
+        if self.morph_var is not None:
+            self.cycle_idx = idx_a
+            self.morph_var.set(t_loc)
+        self._draw_coherence()
+        # Refresh waveform with morphed
+        self._on_morph()
+
+    def _on_pan_wave(self, event):
+        """Pan the zoom window left/right by dragging on the oscilloscope."""
+        dx = event.x - getattr(self, '_pan_last_x', event.x)
+        self._pan_last_x = event.x
+        if not self.cycles: return
+        n = len(self.cycles[self.cycle_idx])
+        zs = self._zoom_start
+        ze = n if self._zoom_end < 0 else self._zoom_end
+        span = ze - zs
+        w = self.wave_cv.winfo_width()
+        samp_per_px = span / max(w, 1)
+        delta = int(-dx * samp_per_px)
+        new_zs = max(0, zs + delta)
+        new_ze = new_zs + span
+        if new_ze > n:
+            new_ze = n
+            new_zs = max(0, n - span)
+        self._zoom_start = new_zs
+        self._zoom_end   = new_ze
+        self._draw_wave()
 
     def _bake_morph(self):
         """Add the current morphed waveform as a new cycle in the bank."""
@@ -2562,6 +2902,9 @@ class App(tk.Tk):
         if disc > 0.01:
             cv.create_text(lpad + 4, tpad + 4, text=f"disc={disc:.2f}",
                            font=("Consolas", 7), fill=mc, anchor="nw")
+        # Draw overlay if enabled
+        if getattr(self, '_show_overlay_var', None) and self._show_overlay_var.get():
+            self._draw_overlay()
 
 
     def _draw_fft(self):
@@ -2603,8 +2946,11 @@ class App(tk.Tk):
             label, _ = classify_cycle(cyc)
             disc      = boundary_discontinuity(cyc)
             # Border: active=hot, phase-warning=amber, phase-bad=red, normal=panel
+            is_selected = i in self._selected_cycles
             if i == self.cycle_idx:
-                border = "#00bcd4"   # cyan — active cycle (distinct from phase warnings)
+                border = "#00bcd4"   # cyan — active cycle
+            elif is_selected:
+                border = "#ffd93d"   # yellow — selected for overlay
             elif disc > 0.20:
                 border = "#c0392b"   # red — severe discontinuity
             elif disc > 0.05:
@@ -2625,6 +2971,10 @@ class App(tk.Tk):
                 th.create_line(*pts, fill=color, width=1)
             idx = i
             th.bind("<Button-1>", lambda e, idx=idx: self._goto_cycle(idx))
+            th.bind("<Control-Button-1>",
+                    lambda e, idx=idx: self._toggle_cycle_selection(idx))
+            th.bind("<Shift-Button-1>",
+                    lambda e, idx=idx: self._toggle_cycle_selection(idx))
             # Show discontinuity score under thumbnail
             disc_txt = f"{disc:.2f}" if disc > 0.01 else ""
             disc_col = "#c0392b" if disc > 0.20 else ("#e67e22" if disc > 0.05 else color)
