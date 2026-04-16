@@ -593,7 +593,12 @@ class App(tk.Tk):
         self.export_sr_var   = tk.IntVar(value=44100)
         self.export_depth_var= tk.IntVar(value=16)
         self.phase_offset_var= tk.IntVar(value=0)
-        self.morph_var       = None
+        self.morph_var        = None
+        self.global_morph_var  = None
+        self._view_btns:       dict = {}
+        self._show_overlay_var       = None
+        self._show_legend_var        = None
+        self._harmonic_filter: set   = set()
         # Zoom state
         self._zoom_start: int = 0
         self._zoom_end:   int = -1
@@ -666,10 +671,23 @@ class App(tk.Tk):
         body = tk.Frame(self, bg=C["bg"])
         body.pack(fill="both", expand=True)
 
-        # Part B — left panel
-        self.panel_b = tk.Frame(body, bg=C["panel"], width=230)
-        self.panel_b.pack(side="left", fill="y")
-        self.panel_b.pack_propagate(False)
+        # Part B — scrollable left panel
+        b_outer = tk.Frame(body, bg=C["panel"], width=246)
+        b_outer.pack(side="left", fill="y")
+        b_outer.pack_propagate(False)
+        b_cv = tk.Canvas(b_outer, bg=C["panel"], highlightthickness=0, width=228)
+        b_sb = ttk.Scrollbar(b_outer, orient="vertical", command=b_cv.yview)
+        b_cv.configure(yscrollcommand=b_sb.set)
+        b_sb.pack(side="right", fill="y")
+        b_cv.pack(side="left", fill="both", expand=True)
+        self.panel_b = tk.Frame(b_cv, bg=C["panel"], width=228)
+        b_cv.create_window((0, 0), window=self.panel_b, anchor="nw")
+        self.panel_b.bind("<Configure>",
+            lambda e, c=b_cv: c.configure(scrollregion=c.bbox("all")))
+        def _b_wheel(event, c=b_cv):
+            c.yview_scroll(int(-1*(event.delta/120)), "units")
+        b_cv.bind("<MouseWheel>",        _b_wheel)
+        self.panel_b.bind("<MouseWheel>", _b_wheel)
         self._build_panel_b()
 
         # Right column: Part C + Part D stacked
@@ -856,11 +874,19 @@ class App(tk.Tk):
 
         ff = tk.Frame(vis_row, bg=C["panel"])
         ff.grid(row=0, column=1, sticky="nsew")
-        tk.Label(ff, text="FFT SPECTRUM", font=("Consolas", 8),
-                 bg=C["panel"], fg=C["muted"]).pack(anchor="w", padx=8, pady=(4, 0))
+        fft_hdr = tk.Frame(ff, bg=C["panel"])
+        fft_hdr.pack(fill="x")
+        tk.Label(fft_hdr, text="FFT SPECTRUM",
+                 font=("Consolas", 8), bg=C["panel"], fg=C["muted"]).pack(
+                     side="left", padx=8, pady=(4, 0))
+        self.fft_filter_lbl = tk.Label(fft_hdr, text="",
+                                       font=("Consolas", 7), bg=C["panel"],
+                                       fg=C["hot"])
+        self.fft_filter_lbl.pack(side="right", padx=6, pady=(4, 0))
         self.fft_cv = tk.Canvas(ff, bg=C["panel"], highlightthickness=0)
         self.fft_cv.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.fft_cv.bind("<Configure>", lambda e: self._draw_fft())
+        self.fft_cv.bind("<Button-1>",  self._on_fft_click)
 
         # ── View mode tabs ──
         tab_row = tk.Frame(p, bg=C["bg"])
@@ -949,7 +975,7 @@ class App(tk.Tk):
         self._sbtn(phase_row, "−10",  lambda: self._shift_cycle(-10)).pack(side="left", padx=1)
         self._sbtn(phase_row, "−1",   lambda: self._shift_cycle(-1)).pack(side="left", padx=1)
         self.phase_sl = tk.Scale(phase_row, variable=self.phase_slider_var,
-                                 from_=-512, to=512, resolution=1,
+                                 from_=-1024, to=1024, resolution=1,
                                  orient="horizontal", length=120,
                                  bg=C["bg"], fg=C["text"], troughcolor=C["accent"],
                                  highlightthickness=0, showvalue=False,
@@ -2423,31 +2449,32 @@ class App(tk.Tk):
         self._refresh_view()
 
     def _refresh_view(self):
-        """Redraw canvases according to current view mode."""
-        if self._view_mode == "waveform":
+        """Redraw left canvas per view mode. FFT (right) is always redrawn."""
+        mode = self._view_mode
+        if mode == "waveform":
             self._draw_wave()
-            self._draw_fft()
-        elif self._view_mode == "fft":
+        elif mode == "fft":
             self.wave_cv.delete("all")
-            self._draw_fft()
-        elif self._view_mode == "heatmap":
+            self.wave_cv.create_text(10, 10, text="FFT always shown →",
+                font=("Consolas", 8), fill=C["muted"], anchor="nw")
+        elif mode == "heatmap":
             self._draw_heatmap()
-            self._draw_fft()
-        elif self._view_mode == "harmonic_lines":
+        elif mode == "harmonic_lines":
             self._draw_harmonic_lines()
-            self._draw_fft()
+        self._draw_fft()
         if self._show_overlay_var.get() and self._selected_cycles:
             self._draw_overlay()
 
     def _toggle_cycle_selection(self, idx: int):
-        """Toggle idx in _selected_cycles (Ctrl+click style on thumbnails)."""
+        """Toggle idx in multi-selection. Auto-enables overlay when non-empty."""
         if idx in self._selected_cycles:
             self._selected_cycles.discard(idx)
         else:
             self._selected_cycles.add(idx)
+        if self._selected_cycles:
+            self._show_overlay_var.set(True)
         self._build_thumbs()
-        if self._show_overlay_var.get():
-            self._draw_overlay()
+        self._refresh_view()
 
     def _draw_overlay(self):
         """Draw selected cycles as colored overlays on the wave canvas."""
@@ -2477,7 +2504,7 @@ class App(tk.Tk):
                 pts.extend([x, y])
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=color, width=1, dash=(4,2))
-            # Legend
+            # Legend on waveform canvas
             if self._show_legend_var.get():
                 label, _ = classify_cycle(cyc)
                 cv.create_rectangle(lpad+4, legend_y, lpad+14, legend_y+8,
@@ -2486,6 +2513,23 @@ class App(tk.Tk):
                                text=f"C{sel_idx+1} {label}",
                                font=("Consolas",7), fill=color, anchor="w")
                 legend_y += 12
+            # FFT overlay — thin colored bars on FFT canvas
+            _, fft_sel = classify_cycle(cyc)
+            fc = self.fft_cv
+            fw, fh = fc.winfo_width(), fc.winfo_height()
+            if fw < 10: continue
+            n_fo   = min(len(fft_sel), 12)
+            lp_f   = 26; bp_f = 18; tp_f = 6
+            dh_f   = fh - tp_f - bp_f
+            slot_f = (fw - lp_f) / max(n_fo, 1)
+            bw_f   = max(2, int(slot_f * 0.25))
+            for ii in range(n_fo):
+                if self._harmonic_filter and ii not in self._harmonic_filter:
+                    continue
+                bh_f = int(float(fft_sel[ii]) * dh_f)
+                xf   = int(lp_f + ii*slot_f + (slot_f-bw_f)/2) + i*3
+                fc.create_rectangle(xf, tp_f+dh_f-bh_f, xf+bw_f, tp_f+dh_f,
+                                    fill=color, outline="")
 
     def _draw_heatmap(self):
         """Draw spectral heatmap: cycles (Y) × harmonics (X), color = amplitude."""
@@ -2571,6 +2615,8 @@ class App(tk.Tk):
         lbls = ["H1(F)","H2","H3","H4","H5","H6","H7","H8",
                 "H9","H10","H11","H12"]
         for hi in range(n_harm):
+            if self._harmonic_filter and hi not in self._harmonic_filter:
+                continue
             color = palette[hi % len(palette)]
             pts   = []
             for ci in range(n_cyc):
@@ -2639,6 +2685,29 @@ class App(tk.Tk):
         self._zoom_start = new_zs
         self._zoom_end   = new_ze
         self._draw_wave()
+
+    def _on_fft_click(self, event):
+        """Click on FFT bar to toggle harmonic in filter (for Lines mode)."""
+        w = self.fft_cv.winfo_width()
+        if w < 10 or not self.cycles: return
+        _, fft = classify_cycle(self.cycles[self.cycle_idx])
+        n      = min(len(fft), 12)
+        lp2    = 26
+        slot   = (w - lp2) / max(n, 1)
+        h_idx  = int((event.x - lp2) / max(slot, 1))
+        if 0 <= h_idx < n:
+            if h_idx in self._harmonic_filter:
+                self._harmonic_filter.discard(h_idx)
+            else:
+                self._harmonic_filter.add(h_idx)
+            if self._harmonic_filter:
+                self.fft_filter_lbl.config(
+                    text="H:" + ",".join(str(i+1) for i in sorted(self._harmonic_filter)))
+            else:
+                self.fft_filter_lbl.config(text="")
+            self._draw_fft()
+            if self._view_mode == "harmonic_lines":
+                self._draw_harmonic_lines()
 
     def _bake_morph(self):
         """Add the current morphed waveform as a new cycle in the bank."""
@@ -2931,13 +3000,15 @@ class App(tk.Tk):
                            font=("Consolas", 7), fill=C["muted"], anchor="e")
         # Bars
         for i in range(n):
-            bh = int(float(fft[i]) * dh)
-            x  = int(lpad + i * slot + (slot - bw) / 2)
+            bh       = int(float(fft[i]) * dh)
+            x        = int(lpad + i * slot + (slot - bw) / 2)
+            filtered = bool(self._harmonic_filter) and i not in self._harmonic_filter
+            bar_col  = C["grid"] if filtered else (C["hot"] if i==0 else C["fft"])
             cv.create_rectangle(x, tpad + dh - bh, x + bw, tpad + dh,
-                                fill=C["hot"] if i == 0 else C["fft"],
-                                outline="")
+                                fill=bar_col, outline="")
             cv.create_text(x + bw // 2, h - 4, text=lbls[i],
-                           font=("Consolas", 7), fill=C["muted"])
+                           font=("Consolas", 7),
+                           fill=C["muted"] if filtered else C["text"])
 
     def _build_thumbs(self):
         for w in self.thumb_frame.winfo_children():
